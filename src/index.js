@@ -1,68 +1,58 @@
-// API funtion
+import { EDfunction } from "./backend/ecole_directe/index.js";
+
+// ed-client-worker — internal ÉcoleDirecte API.
+//
+// This worker is NOT meant to be reached from the public internet: it is
+// called by other workers of the same Cloudflare account through a service
+// binding (e.g. env.ED_CLIENT.fetch(...)). It owns the whole ED session —
+// login, cookies, token cache and the 2FA (QCM) relay — so callers just ask
+// for a feature and get the data back.
+//
+// Routes (subpath of the request path):
+//   GET  /info          student account info (also triggers login / QCM)
+//   GET  /grades        grades            (header "filter: true" = light)
+//   GET  /averages      grade averages
+//   GET  /new-grades    grades since last check (used by the cron workflow)
+//   GET  /homeworks     homework list     (header "filter: true" = light)
+//   POST /homeworks     { id, done }      mark homework done/undone
+//   GET  /timetable     timetable         (header "filter: true" = week grid)
+//   POST /qcm           { choice }        answer the pending 2FA questionnaire
+//
+// When ÉcoleDirecte requires the 2FA questionnaire, every route returns
+// { qcm_required: true, question, propositions } — the caller must relay it
+// to the end user and POST the answer to /qcm before retrying.
+
+const JSON_HEADERS = { "Content-Type": "application/json" };
+
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const method = request.method;
-    const headers = request.headers
-    let body;
-    const contentType = request.headers.get('content-type') || '';
-    const corsHeaders = {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, DELETE, PUT, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "*"
-    };
-    
-    // =========================
-    // 📶 MAIN API
-    // =========================
-    if (url.pathname.startsWith("/api/")) {
-      try {
-        let resp = {object: "nothing"};
-        // Return res111ponse
-        return new Response(JSON.stringify({
-          resp
-        }), {
-          headers: corsHeaders
-        })
-      } catch (e) {
-        console.error("API ERROR:", e?.stack || e);
-        // await sendErrorEmail(env, e, `API ${url.pathname}`);
-        return new Response(JSON.stringify({
-          error: e?.message,
-        }), {
-          status: 500,
-          headers: corsHeaders
-        });
+
+    let body = null;
+    const contentType = request.headers.get("content-type") || "";
+    if (method !== "GET" && method !== "HEAD") {
+      if (contentType.includes("multipart/form-data")) {
+        body = await request.formData();
+      } else {
+        try {
+          body = JSON.parse(await request.text());
+        } catch {
+          body = {};
+        }
       }
     }
-    // =========================
-    // 🌐 SITE (Cloudflare assets)
-    // =========================
-    // Add CORS headers for assets to allow browser loading
-    if (url.pathname.startsWith("/assets/") && method==="GET") {
-      const assetResponse = await env.ASSETS.fetch(request);
-      
-      if (assetResponse.ok) {
-        // For SVG files, serve with correct content-type
-        const isSvg = url.pathname.endsWith('.svg');
-        const contentType = isSvg ? 'image/svg+xml; charset=utf-8' : (assetResponse.headers.get("Content-Type") || "application/octet-stream");
-        
-        return new Response(assetResponse.body, {
-          headers: corsHeaders
-        });
-      }
-      return assetResponse;
+
+    try {
+      const subpath = url.pathname.replace(/^\/+/, "");
+      const result = await EDfunction(env, subpath, method, request.headers, body);
+      return new Response(JSON.stringify(result), { headers: JSON_HEADERS });
+    } catch (e) {
+      console.error("ED API ERROR:", e?.stack || e);
+      return new Response(JSON.stringify({ error: e?.message || "ED error" }), {
+        status: 500,
+        headers: JSON_HEADERS,
+      });
     }
-    // Pages
-    if (
-      url.pathname === "/" ||
-      url.pathname === ""
-    ) {
-      const assetUrl = new URL(request.url);
-      assetUrl.pathname = "/pages/home/index.html";
-      return env.ASSETS.fetch(new Request(assetUrl, request));
-    }
-    return env.ASSETS.fetch(request)
-  }
-}
+  },
+};

@@ -1,0 +1,6 @@
+# Local development only — never commit real credentials.
+# In production, set these as Worker secrets/vars on ed-client-worker:
+#   wrangler secret put ED_USERNAME   (or dashboard → Settings → Variables)
+#   wrangler secret put ED_PASSWORD
+ED_USERNAME=your_ecoledirecte_id
+ED_PASSWORD=your_ecoledirecte_password

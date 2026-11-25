@@ -1,16 +1,12 @@
 {
-  // Principal informations
-  "name": "worker_name",
+  // ed-client-worker — internal ÉcoleDirecte API.
+  // No public URL: only reachable through service bindings from other
+  // workers of the same account (env.ED_CLIENT.fetch(...)).
+  "name": "ed-client-worker",
   "main": "src/index.js",
   "compatibility_date": "2026-07-19",
-  "workers_dev": true,
+  "workers_dev": false,
   "compatibility_flags": ["nodejs_compat"],
-
-  // Static site
-  "assets": {
-    "directory": "./src/frontend",
-    "binding": "ASSETS"
-  },
 
   // Observability
   "observability": {
