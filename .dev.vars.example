@@ -1,6 +1,17 @@
 # Local development only — never commit real credentials.
-# In production, set these as Worker secrets/vars on ed-client-worker:
-#   wrangler secret put ED_USERNAME   (or dashboard → Settings → Variables)
-#   wrangler secret put ED_PASSWORD
+# In production, set these as Worker secrets/vars on ed-client-worker
+# (wrangler secret put <NAME> or dashboard → Settings → Variables).
 ED_USERNAME=your_ecoledirecte_id
 ED_PASSWORD=your_ecoledirecte_password
+
+# Optional — used to auto-answer the ÉcoleDirecte 2FA questionnaire.
+# When missing or when the question isn't recognized, the QCM is relayed
+# to the client (manual flow) instead.
+BORN_DAY=
+BORN_MONTH=
+BORN_YEAR=
+ED_CLASS=
+ED_TEACHER=
+
+# Optional — defaults to "Lumaris-Dashboard/1.0 (+https://lumaris.fr)"
+# USER_AGENT=

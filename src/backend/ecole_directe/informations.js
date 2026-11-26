@@ -7,6 +7,125 @@ function edUserAgent(env) {
   return env.USER_AGENT || ED_USER_AGENT;
 }
 
+const norm = (s) =>
+  String(s)
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+// Tries to answer the 2FA questionnaire automatically using the account
+// secrets (BORN_DAY / BORN_MONTH / BORN_YEAR / ED_CLASS / ED_TEACHER).
+// Returns the matching proposition, or null when the question isn't handled
+// or the secrets aren't configured — caller then falls back to the manual
+// client-side QCM flow.
+function tryAutoAnswerQCM(question, propositions, env) {
+  const secrets = {
+    jour: env.BORN_DAY,
+    mois: env.BORN_MONTH,
+    annee: env.BORN_YEAR,
+    professeur: env.ED_TEACHER,
+    classe: env.ED_CLASS,
+  };
+  const q = norm(question);
+  let expected = null;
+  if (q.includes("jour")) expected = secrets.jour;
+  else if (q.includes("mois")) expected = secrets.mois;
+  else if (q.includes("annee") || q.includes("année") || q.includes("ann")) expected = secrets.annee;
+  else if (q.includes("professeur")) expected = secrets.professeur;
+  else if (q.includes("classe")) expected = secrets.classe;
+  if (expected === null || expected === undefined || expected === "") return null;
+  const match = propositions.find((p) => norm(p) === norm(expected));
+  return match || null;
+}
+
+// Posts the chosen proposition to ÉcoleDirecte, then re-logins with the
+// returned fa factors and caches the session. Shared by the automatic and
+// manual (client-answered) QCM paths.
+async function completeQCMLogin(env, pending, selected) {
+  const userAgent = edUserAgent(env);
+  const user = env.ED_USERNAME || env.ED_USER;
+  const password = env.ED_PASSWORD;
+
+  const body = new URLSearchParams();
+  body.set("data", JSON.stringify({
+    choix: btoa(unescape(encodeURIComponent(selected)))
+  }));
+  const resQcm = await fetch(
+    "https://api.ecoledirecte.com/v3/connexion/doubleauth.awp?verbe=post", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "X-Token": pending.token,
+      "Cookie": (pending.cookies || []).join("; "),
+      "User-Agent": userAgent
+    },
+    body: body.toString()
+  });
+  const qcmJson = await resQcm.json();
+  if (qcmJson.code !== 200 || !qcmJson.data?.cn || !qcmJson.data?.cv) {
+    throw new Error(`Échec QCM: ${JSON.stringify(qcmJson)}`);
+  }
+
+  // Re-login with the fa factors — same payload shape as a fresh login.
+  const gtkRes = await fetch("https://api.ecoledirecte.com/v3/login.awp?gtk=1&v=4.75.0", {
+    method: "GET",
+    headers: {
+      "User-Agent": userAgent,
+      "Accept": "application/json, text/plain, */*",
+      "Referer": "https://www.ecoledirecte.com/",
+      "Origin": "https://www.ecoledirecte.com"
+    }
+  });
+  const setCookies = [];
+  if (typeof gtkRes.headers.getSetCookie === "function") {
+    setCookies.push(...gtkRes.headers.getSetCookie());
+  }
+  const rawSetCookie = gtkRes.headers.get("set-cookie");
+  if (rawSetCookie && setCookies.length === 0) setCookies.push(rawSetCookie);
+  const gtk = setCookies.map((c) => c.match(/GTK=([^;]+)/)?.[1]).find(Boolean);
+  if (!gtk) throw new Error("GTK introuvable");
+
+  const loginBody = new URLSearchParams();
+  loginBody.append("data", JSON.stringify({
+    identifiant: user,
+    motdepasse: password,
+    isRelogin: false,
+    uuid: "",
+    fa: [{ cn: qcmJson.data.cn, cv: qcmJson.data.cv }]
+  }));
+  const reloginRes = await fetch("https://api.ecoledirecte.com/v3/login.awp?v=4.75.0", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": userAgent,
+      "Accept": "application/json, text/plain, */*",
+      "Referer": "https://www.ecoledirecte.com/",
+      "Origin": "https://www.ecoledirecte.com",
+      "X-Gtk": gtk,
+      "Cookie": setCookies.join("; ")
+    },
+    body: loginBody.toString()
+  });
+  const reloginText = await reloginRes.text();
+  let reloginJson;
+  try {
+    reloginJson = JSON.parse(reloginText);
+  } catch {
+    throw new Error(`Re-login après QCM: réponse invalide ${reloginText.slice(0, 200)}`);
+  }
+  if (reloginJson.code !== 200) {
+    throw new Error(`Re-login après QCM échoué: ${JSON.stringify(reloginJson)}`);
+  }
+  const tokenFromHeader = reloginRes.headers.get("x-token") || reloginRes.headers.get("X-Token") || "";
+  const token = tokenFromHeader || reloginJson.token || "";
+
+  const session = { json: reloginJson, gtk, cookies: setCookies, token };
+  await setCacheValue("edToken", session);
+  await setCacheValue("edTokenTime", Math.floor(Date.now() / 60000));
+  return session;
+}
+
 // Returns either a logged-in session ({ token, json, gtk, cookies }) or a
 // { qcm_required: true, question, propositions } marker when ÉcoleDirecte
 // asks for the 2FA questionnaire — the client answers it via EDanswerQCM.
@@ -134,6 +253,20 @@ export async function EDinformations(env, new_token) {
     throw new Error(`QCM 2FA introuvable: ${challengeText.slice(0, 200)}`);
   }
 
+  // Automatic answer first — uses the account secrets configured on this
+  // worker. Falls back to the manual client-side QCM when the question
+  // isn't handled or the secrets are missing.
+  const autoAnswer = tryAutoAnswerQCM(question, propositions, env);
+  if (autoAnswer) {
+    try {
+      const session = await completeQCMLogin(env, { token: first.token, cookies: first.cookies }, autoAnswer);
+      await setCacheValue("edQcmPending", null);
+      return session;
+    } catch (e) {
+      console.log(`Auto QCM failed (${e.message}), falling back to manual QCM`);
+    }
+  }
+
   // Stash the pending session so EDanswerQCM can complete the login.
   await setCacheValue("edQcmPending", {
     token: first.token,
@@ -161,88 +294,12 @@ export async function EDanswerQCM(env, choiceIndex) {
     throw new Error("Réponse QCM invalide");
   }
 
-  const userAgent = edUserAgent(env);
-  const body = new URLSearchParams();
-  body.set("data", JSON.stringify({
-    choix: btoa(unescape(encodeURIComponent(selected)))
-  }));
-  const resQcm = await fetch(
-    "https://api.ecoledirecte.com/v3/connexion/doubleauth.awp?verbe=post", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "X-Token": pending.token,
-      "Cookie": (pending.cookies || []).join("; "),
-      "User-Agent": userAgent
-    },
-    body: body.toString()
-  });
-  const qcmJson = await resQcm.json();
-  if (qcmJson.code !== 200 || !qcmJson.data?.cn || !qcmJson.data?.cv) {
-    throw new Error(`Échec QCM: ${JSON.stringify(qcmJson)}`);
-  }
-
-  // Re-login with the fa factors — same payload shape as a fresh login.
-  const user = env.ED_USERNAME || env.ED_USER;
-  const password = env.ED_PASSWORD;
-  const { gtk, cookies } = await (async () => {
-    const gtkRes = await fetch("https://api.ecoledirecte.com/v3/login.awp?gtk=1&v=4.75.0", {
-      method: "GET",
-      headers: {
-        "User-Agent": userAgent,
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.ecoledirecte.com/",
-        "Origin": "https://www.ecoledirecte.com"
-      }
-    });
-    const setCookies = [];
-    if (typeof gtkRes.headers.getSetCookie === "function") {
-      setCookies.push(...gtkRes.headers.getSetCookie());
-    }
-    const rawSetCookie = gtkRes.headers.get("set-cookie");
-    if (rawSetCookie && setCookies.length === 0) setCookies.push(rawSetCookie);
-    const gtkValue = setCookies.map((c) => c.match(/GTK=([^;]+)/)?.[1]).find(Boolean);
-    if (!gtkValue) throw new Error("GTK introuvable");
-    return { gtk: gtkValue, cookies: setCookies };
-  })();
-
-  const loginBody = new URLSearchParams();
-  loginBody.append("data", JSON.stringify({
-    identifiant: user,
-    motdepasse: password,
-    isRelogin: false,
-    uuid: "",
-    fa: [{ cn: qcmJson.data.cn, cv: qcmJson.data.cv }]
-  }));
-  const reloginRes = await fetch("https://api.ecoledirecte.com/v3/login.awp?v=4.75.0", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "User-Agent": userAgent,
-      "Accept": "application/json, text/plain, */*",
-      "Referer": "https://www.ecoledirecte.com/",
-      "Origin": "https://www.ecoledirecte.com",
-      "X-Gtk": gtk,
-      "Cookie": cookies.join("; ")
-    },
-    body: loginBody.toString()
-  });
-  const reloginText = await reloginRes.text();
-  let reloginJson;
   try {
-    reloginJson = JSON.parse(reloginText);
-  } catch {
-    throw new Error(`Re-login après QCM: réponse invalide ${reloginText.slice(0, 200)}`);
+    const session = await completeQCMLogin(env, pending, selected);
+    await setCacheValue("edQcmPending", null);
+    return session;
+  } catch (e) {
+    await setCacheValue("edQcmPending", null);
+    throw e;
   }
-  if (reloginJson.code !== 200) {
-    throw new Error(`Re-login après QCM échoué: ${JSON.stringify(reloginJson)}`);
-  }
-  const tokenFromHeader = reloginRes.headers.get("x-token") || reloginRes.headers.get("X-Token") || "";
-  const token = tokenFromHeader || reloginJson.token || "";
-
-  const session = { json: reloginJson, gtk, cookies, token };
-  await setCacheValue("edToken", session);
-  await setCacheValue("edTokenTime", Math.floor(Date.now() / 60000));
-  await setCacheValue("edQcmPending", null);
-  return session;
 }

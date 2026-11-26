@@ -31,7 +31,11 @@ All routes are subpaths of the request URL. Request/response bodies are JSON.
 
 ### 2FA (QCM) flow
 
-When ÉcoleDirecte answers login code `250`, **every** route returns:
+When ÉcoleDirecte answers login code `250`, the worker **first tries to
+answer the questionnaire automatically** using the account secrets
+(`BORN_DAY` / `BORN_MONTH` / `BORN_YEAR` / `ED_CLASS` / `ED_TEACHER`). If the
+question isn't recognized or the secrets aren't configured, every route
+returns:
 
 ```json
 { "qcm_required": true, "question": "…", "propositions": ["…", "…"] }
@@ -47,6 +51,11 @@ original route can be retried.
 |---|---|---|
 | `ED_USERNAME` | Worker secret/var | ÉcoleDirecte identifier |
 | `ED_PASSWORD` | Worker secret/var | ÉcoleDirecte password |
+| `BORN_DAY` | Worker secret/var | Birth day — auto-answers "jour de naissance" QCMs |
+| `BORN_MONTH` | Worker secret/var | Birth month — auto-answers "mois de naissance" QCMs |
+| `BORN_YEAR` | Worker secret/var | Birth year — auto-answers "année de naissance" QCMs |
+| `ED_CLASS` | Worker secret/var | Class name — auto-answers "classe" QCMs |
+| `ED_TEACHER` | Worker secret/var | Main teacher name — auto-answers "professeur" QCMs |
 | `USER_AGENT` | optional var | overrides the default `Lumaris-Dashboard/1.0` UA |
 
 Set credentials on the deployed worker (never commit them):
@@ -54,6 +63,11 @@ Set credentials on the deployed worker (never commit them):
 ```bash
 wrangler secret put ED_USERNAME
 wrangler secret put ED_PASSWORD
+wrangler secret put BORN_DAY
+wrangler secret put BORN_MONTH
+wrangler secret put BORN_YEAR
+wrangler secret put ED_CLASS
+wrangler secret put ED_TEACHER
 ```
 
 Bindings declared in other workers' `wrangler.jsonc` (resolved by
